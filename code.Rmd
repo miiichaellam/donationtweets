@@ -1,0 +1,370 @@
+---
+title: "Analyses code"
+author: "Michael Lam, Barbara M Masser, Barnaby J. Dixson"
+editor_options: 
+  chunk_output_type: console
+---
+# Packages and data
+```{r eval=FALSE}
+# clear environemnt
+rm(list=ls())
+
+# Package to install for all packages required 
+if (!require("pacman")) install.packages("pacman")
+
+# All packages needed (will install if not already)
+pacman::p_load(tidyverse,tidytext,stm,scales,reshape2,furrr,rtweet,sjPlot,pscl)
+
+# Data
+df<- read_twitter_csv("https://raw.githubusercontent.com/miiichaellam/donationtweets/main/tdata.csv")
+```
+
+
+# Data cleaning
+## Text pre-processing
+```{r eval=FALSE}
+# standardising and removing unwated words 
+tweetsdf<-df%>%
+  mutate(
+    tweet = iconv(tweet, to = "ASCII", sub = ""),  # Convert to basic ASCII
+    tweet = tolower(tweet))%>% # make all words lowercase
+  select(tweet,id)%>%
+  mutate(tweet = str_remove_all(tweet, "@\\w+"), # remove user names
+         tweet = gsub("[[:punct:]]",'',tweet), # punctuations
+         tweet = str_remove_all(tweet, "http.+ |http.+$"), # remove URL/links
+         tweet = str_remove_all(tweet, '\\d'),       # remove numbers
+         tweet = str_remove_all(tweet,"amp"), # remove punctuation [ands]
+         tweet = gsub("^[[:space:]]*","",tweet),## Remove leading whitespaces"
+         tweet = gsub("[[:space:]]*$","",tweet)) ## Remove trailing whitespaces
+
+# Create library of words to keep
+keep_words<- tibble(word = c(
+# Keeping words that highlight self and other regards
+  'others','other','right'),
+  lexicon = 'mine')
+
+# antijoin with stop word library to preserve words of interest
+newstopwords<- anti_join(stop_words,keep_words, by = 'word')
+
+# Adding extra stop words
+mystopwords<- tibble(
+  word = c(
+# Blood service handles and donor centres
+"nhs","people","glasgow", "edinburgh","tooting","oxford","west","north",
+"lauriston","plymouth","itvbloodsquad", "leeds", "london", "worldblooddonorday",
+# Reference to self
+  "im","ive", "me","i","you","your","youre","id","youve",
+# Time of the day
+"time", "times","day","days", "week","weeks","evening","morning","yesterday","tonight","christmas","months","afternoon","year","friday",
+"tomorrow","today",
+# Number of donation
+"st","th","stdonation","thdonation",
+# Donated product
+"plasma", "bone", "marrow", "platelet", "platelets"
+),lexicon = "twitter")%>%
+# combine with already adjusted stop word library
+  bind_rows(newstopwords)       
+
+# Breaking tweets down into single words & removing unwanted words
+tidy_tweets <-tweetsdf %>%
+  unnest_tokens(word, tweet, token = "tweets") %>% # break down tweets to one word per row
+  anti_join(mystopwords, by = 'word')%>%
+  filter(!str_detect(word,"^don"))%>% # any words that start with don (e.g., donated, donating, donor)
+  filter(!str_detect(word,"^giv"))%>%
+  filter(!str_detect(word,"^blood"))%>%
+  filter(!str_detect(word,"^take"))
+
+# Using sparse matrix
+tweets_sparse <- tidy_tweets %>%
+  count(id, word) %>%
+  cast_sparse(id, word, n)
+
+```
+
+
+# Topic Modelling
+## Training Topic Model
+```{r eval=FALSE}
+# Parallel processing - enable multiple topic models to be trained simultaneously 
+plan(multisession) 
+# training topic models ranging from 3 topics to 11 topics, in 1 topic increments and then 10 topic increments beyond to 31
+many_models <- tibble(K = c(seq(3,10,1), seq(11,31,10))) %>% 
+  mutate(topic_model = future_map(K, ~stm(tweets_sparse, K = .,verbose = F,init.type = "Spectral")))
+```
+
+## Model Evaluation 
+```{r eval=FALSE}
+# extracting model diagnostics from topic model to plot
+heldout <- make.heldout(tweets_sparse, seed = 198)
+k_result <- many_models %>%
+mutate(exclusivity = map(topic_model, exclusivity),
+         semantic_coherence = map(topic_model, semanticCoherence, tweets_sparse),
+         eval_heldout = map(topic_model, eval.heldout, heldout$missing),
+         residual = map(topic_model, checkResiduals, tweets_sparse),
+         bound =  map_dbl(topic_model, function(x) max(x$convergence$bound)),
+         lfact = map_dbl(topic_model, function(x) lfactorial(x$settings$dim$K)),
+         lbound = bound + lfact,
+         iterations = map_dbl(topic_model, function(x) length(x$convergence$bound)))
+
+# Plot topic models with diagnostic including all trained models.
+k_result %>%
+  transmute(K,
+            `Lower bound` = lbound,
+            Residuals = map_dbl(residual, "dispersion"),
+            `Semantic coherence` = map_dbl(semantic_coherence, mean),
+            `Held-out likelihood` = map_dbl(eval_heldout, "expected.heldout")) %>%
+  gather(Metric, Value, -K) %>%
+  ggplot(aes(K, Value, color = Metric)) +
+  geom_line(size = 1.5, alpha = 0.7, show.legend = FALSE) +
+  geom_line(aes(x = 7), linetype = "dashed", show.legend = FALSE) +
+  facet_wrap(~Metric, scales = "free_y") + 
+  labs(x = "Number of topics",
+       y = NULL) 
+
+# Narrow diagnostics into optimal range
+k_result %>%
+  filter(K %in% c(3:11))%>%
+  transmute(K,
+            `Lower bound` = lbound,
+            Residuals = map_dbl(residual, "dispersion"),
+            `Semantic coherence` = map_dbl(semantic_coherence, mean),
+            `Held-out likelihood` = map_dbl(eval_heldout, "expected.heldout")) %>%
+  gather(Metric, Value, -K) %>%
+  ggplot(aes(K, Value, color = Metric)) +
+  geom_line(size = 1.5, alpha = 0.7, show.legend = FALSE) +
+  geom_line(aes(x = 7), linetype = "dashed", show.legend = FALSE) +
+  facet_wrap(~Metric, scales = "free_y") + 
+  scale_x_continuous(breaks = seq(3,10,1))+
+  labs(x = "Number of topics",
+       y = NULL)  +
+  theme_minimal()
+
+# Examining Semantic coherence and Exclusivity [alternative way to plot]
+k_result %>%
+  select(K, exclusivity, semantic_coherence) %>%
+  filter(K %in% c(7,8)) %>%
+  unnest(cols = c(exclusivity, semantic_coherence)) %>%
+  mutate(K = as.factor(K)) %>%
+  ggplot(aes(semantic_coherence, exclusivity, color = K)) +
+  geom_point(size = 2, alpha = 0.8) +
+  #geom_text(aes(y=exclusivity+.15,label = K), vjust=1) +
+  scale_y_continuous(limits = c(0,10)) +
+  theme_bw()+
+  labs(x = "Semantic coherence",
+       y = "Exclusivity",
+       title = "Comparing exclusivity and semantic coherence") 
+```
+
+### Semantic coherence and Exclusivity 
+```{r}
+# using STM package to get average of both model diagnostics
+# requires data in different format, so recleaning here same as above
+# remove punctuation for stm
+mod_words<- stop_words%>%
+  mutate(word = gsub("[[:punct:]]",'',word))
+
+# Adding extra stop words
+xtra_mystopwords<- tibble(
+  word = c(
+"nhs","canadaslifeline","people","glasgow", "edinburgh","tooting","oxford","west","north",
+"lauriston","plymouth","itvbloodsquad", "leeds", "london", "worldblooddonorday",
+# Reference to self
+  "im","ive", "me","i","you","your","youre","id","youve",
+# Time of the day
+"time", "times","day","days", "week","weeks","evening","morning","yesterday","tonight","christmas","months","afternoon","year","friday",
+"tomorrow","today",
+# Number of donation
+"st","th","stdonation","thdonation",
+# Donated product
+"plasma", "bone", "marrow", "platelet", "platelets",
+"donating","blood","take","takes","taken","blooddonations","blooddonation",
+"give","giveblood","giving","donate","donated","donation","donations","donor","donors"
+),lexicon = "twitter")%>%
+# combine with already adjusted stop word library
+  bind_rows(mod_words)     
+
+# creating character vector for STM
+semstm<- pull(xtra_mystopwords,var = "word")
+
+# process
+tweetprocess<- textProcessor(documents = tweetsdf$tweet,metadata = tweetsdf, stem = FALSE,verbose = FALSE, 
+                             removestopwords = TRUE, language = "en",striphtml = TRUE,
+                             customstopwords = semstm)
+# traning the model above 
+manymodels<- searchK(tweetprocess$documents,heldout.seed = 2989, tweetprocess$vocab,K = c(seq(3,10,1)))
+
+# Getting dataframe to plot
+evalplot<-manymodels$results%>%unnest(cols = c(K, exclus, semcoh, heldout, residual, bound, lbound, em.its))%>%
+  mutate(K = as.factor(K))
+
+# plot
+evalplot%>%
+  filter(K %in% c(3:10))%>%
+  ggplot(aes(x = semcoh, y = exclus, colour = K)) +
+  geom_point() + geom_label(aes(y=exclus-.05,label = K), vjust=1)+
+  labs(x = "Semantic Coherence", y = "Exclusivity") +
+  scale_y_continuous(limits = c(0,10)) +
+  guides(colour=FALSE) 
+```
+
+# Examining the model
+## 7 Topic model
+```{r}
+# make final model an object
+finalmodel<- k_result %>% 
+  filter(K == 7) %>% 
+  pull(topic_model) %>% 
+  .[[1]]
+
+# Show all word profiles
+k_result %>% 
+  filter(K == 7) %>% 
+  pull(topic_model) %>% 
+  .[[1]]%>%
+  labelTopics()
+```
+
+
+### Distribution of topics [numerical]
+```{r}
+# getting beta which are topic-word density (i.e., probability of word belong to a topic)
+td_beta <- tidy(finalmodel)
+
+# getting gamma which is an estimated proportion of words from that document that are generated from that topic.
+td_gamma <- tidy(finalmodel, matrix = "gamma",
+                 document_names = rownames(tweets_sparse))
+# getting top 7 betas
+top_terms <- td_beta %>%
+  arrange(beta) %>%
+  group_by(topic) %>%
+  top_n(7, beta) %>%
+  arrange(-beta) %>%
+  select(topic, term) %>%
+  summarise(terms = list(term)) %>%
+  mutate(terms = map(terms, paste, collapse = ", ")) %>% 
+  unnest(c(terms))
+# getting gamma terms
+gamma_terms <- td_gamma %>%
+  group_by(topic) %>%
+  summarise(gamma = mean(gamma)) %>%
+  arrange(desc(gamma)) %>%
+  left_join(top_terms, by = "topic") %>%
+  mutate(topic = paste0("Topic ", topic),
+         topic = reorder(topic, gamma))
+## show number percentage of topics
+# getting top 6 betas
+top_terms <- td_beta %>%
+  arrange(beta) %>%
+  group_by(topic) %>%
+  top_n(7, beta) %>%
+  arrange(-beta) %>%
+  select(topic, term) %>%
+  summarise(terms = list(term)) %>%
+  mutate(terms = map(terms, paste, collapse = ", ")) %>% 
+  unnest(c(terms))
+# getting gamma terms
+gamma_terms%>%mutate("topic percentage" = gamma*100)
+```
+
+### Plotting topics with proportion and key terms: FREX & Probable words
+```{r}
+# Extract data from topic model
+fdf<-k_result %>% 
+  filter(K == 7) %>% 
+  pull(topic_model) %>% 
+  .[[1]]%>%
+  labelTopics()
+
+# Create FREX words dataframe
+frex_terms<-as.data.frame(fdf$frex)%>%
+  select(,starts_with("V"))%>%
+  unite(col = "FREX", sep = ", ")%>%
+  mutate(topic = as.factor(row_number()))%>%
+  mutate(topic = fct_recode(topic,"Topic 1" = "1",
+                            "Topic 2" = "2",
+                            "Topic 3" = "3",
+                            "Topic 4" = "4",
+                            "Topic 5" = "5",
+                            "Topic 6" = "6",
+                            "Topic 7" = "7"))
+
+# Combine with Probability words
+word_df<-left_join(x = gamma_terms,y = frex_terms, by = "topic")
+  # pivot longer for 
+
+# Plot (in wide format)
+word_df%>%
+  mutate(topic = fct_recode(topic,"Staff and donation centre (Topic 1)" = "Topic 1",
+                            "Donation snacks (Topic 2)" = "Topic 2",
+                            "Text messages (Topic 3)" = "Topic 3",
+                            "Achievement (Topic 4)" = "Topic 4",
+                            "Impact of text messages (Topic 5)" = "Topic 5",
+                            "Post donation thoughts (Topic 6)" = "Topic 6",
+                            "Just donated (Topic 7)" = "Topic 7"
+                            ))%>%
+  ggplot(aes(topic, gamma)) +
+  geom_col(aes(fill = topic),show.legend = FALSE, alpha = 0.8) +
+  geom_text(aes(label = terms, color = "red"),show.legend = FALSE,hjust = 0, nudge_y = 0.0005,
+             nudge_x = -0.1, size = 5) +
+  geom_text(aes(label = FREX),hjust = 0,nudge_y = 0.0005,nudge_x = 0.1, size = 5) +
+  geom_label(aes(label = scales::percent(gamma)),nudge_y = -0.03) +
+  coord_flip() +
+  scale_y_continuous(
+                     limits = c(0, 1),
+                     labels = scales::percent_format()) +
+  labs(x = NULL, y = "Topic proportion")+
+  theme_bw() +
+  theme(plot.subtitle = element_text(face = "italic"), 
+        panel.grid.major = element_blank() , panel.grid.minor = element_blank(),
+        axis.text.y = element_text(size = 11)) +
+  scale_fill_viridis_d()
+```
+
+## Exploratory analyses: Predicting retweet and favourites
+### Detection algorithm
+```{r}
+# detection algorithm
+# create key words to help detection in responses
+save_words<- c("save life", "savelife", "savealife", 
+               "save live","save lives", "savelive", "savelives", "savealive", "saving lives", "savinglives",
+               "life saving", "save", "life", "live")
+
+# create score based on detection
+df<- df%>%
+  mutate(save_live = as.factor(ifelse(
+    str_detect(tweet, paste(save_words, collapse = "|")),
+    "mention", "no mention"
+  )))%>%
+  mutate(save_live = relevel(save_live, ref = "no mention"))
+
+# count
+df%>%count(save_live)
+```
+
+### Analyses
+```{r}
+# look at distribution of retweets
+df%>%ggplot(aes(x = retweet)) +
+  geom_histogram(binwidth = 1) +
+  theme_bw() +
+  labs(x = "Retweet count") 
+
+# scale down to less than 50
+df%>%
+  filter(retweet<=50)%>%
+  ggplot(aes(x = retweet)) +
+  geom_histogram(binwidth = 1) +
+  theme_bw() +
+  labs(x = "Retweet count") 
+
+# check if there's overdispersion in the data
+AER::dispersiontest(glm(retweet~save_live,family = "poisson",data = df))
+## Hurdle model - with full dataset
+summary(rtmodel<-pscl::hurdle(retweet~save_live+text_char+friends,dist = "negbin",data = df))
+## Hurdle model - with trimmed data set
+summary(rtmodel_trim<-pscl::hurdle(retweet~save_live+text_char+friends,dist = "negbin",data = subset(df,df$retweet<=50)))
+## put into table
+sjPlot::tab_model(rtmodel_trim,rtmodel,show.aic = TRUE, show.se = TRUE,show.loglik = T,show.est = T,
+                  pred.labels = c("Intercept", "Mentions save lives (vs. not)", "Number of character text", "Friends"),
+                  dv.labels = c("Retweet count (tweets with <=50 retweet)", "Retweet count (full sample)"))
+```
